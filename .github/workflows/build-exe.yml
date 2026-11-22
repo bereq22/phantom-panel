@@ -1,31 +1,40 @@
 name: build-windows-exe
 
 on:
-  workflow_dispatch:        # botao "Run workflow" na aba Actions
+  workflow_dispatch:
   push:
     paths:
       - 'phantom_panel.py'
       - 'phantom.ico'
       - '.github/workflows/build-exe.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install PyInstaller
         run: pip install pyinstaller
-
       - name: Build PhantomPanel.exe
         run: pyinstaller --onefile --noconsole --name PhantomPanel --icon phantom.ico phantom_panel.py
-
-      - name: Upload exe
+      - name: Upload exe (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: PhantomPanel-exe
           path: dist/PhantomPanel.exe
+      - name: Commit exe back to repo
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item dist/PhantomPanel.exe build/PhantomPanel.exe -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build/PhantomPanel.exe
+          git commit -m "ci: built PhantomPanel.exe"
+          git push
