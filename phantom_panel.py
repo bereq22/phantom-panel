@@ -1,22 +1,23 @@
-# language: Python 3.9+  | file: phantom_panel.py | target: Windows (modo demo em outros SOs)
-# PHANTOM PANEL - utilitario anti-AFK / keep-awake de nivel de sistema.
-# Manda um sinal inofensivo (tecla F15 e/ou micro-jiggle de mouse que retorna a
-# posicao) para o SO e apps normais nao marcarem a sessao como ociosa.
-# Mantem o COMPUTADOR acordado. Nao injeta input de gameplay e nao e bypass de anticheat.
+# language: Python 3.9+  | file: phantom_panel.py | target: Windows (modo demo fora do Windows)
+# PHANTOM PANEL v2 - utilitario keep-awake / anti-AFK de nivel de sistema.
+# Mantem o COMPUTADOR e a sessao acordados. Nao injeta input de gameplay,
+# nao move personagem em jogo nenhum e nao e bypass de anticheat.
 
 import sys
 import time
+import math
 import random
 import tkinter as tk
 
 IS_WIN = sys.platform.startswith("win")
 
-# ---------------- backend de input (Windows / ctypes SendInput) ----------------
+# ---------------- backend de input (Windows / ctypes) ----------------
 if IS_WIN:
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     PUL = ctypes.POINTER(ctypes.c_ulong)
 
     class KEYBDINPUT(ctypes.Structure):
@@ -37,196 +38,233 @@ if IS_WIN:
 
     INPUT_KEYBOARD = 1
     KEYEVENTF_KEYUP = 0x0002
-    VK_F15 = 0x7E  # tecla "no-op": nao digita nada, so conta como atividade
+    VK_F15 = 0x7E   # tecla no-op: nao digita, nao mexe em jogo, so conta como atividade
+    VK_F8  = 0x77   # hotkey global liga/desliga
+
+    ES_CONTINUOUS        = 0x80000000
+    ES_SYSTEM_REQUIRED   = 0x00000001
+    ES_DISPLAY_REQUIRED  = 0x00000002
 
     def tap_key(vk=VK_F15):
-        extra = ctypes.c_ulong(0)
-        down = INPUT(type=INPUT_KEYBOARD, u=_U(ki=KEYBDINPUT(vk, 0, 0, 0, ctypes.pointer(extra))))
-        up = INPUT(type=INPUT_KEYBOARD, u=_U(ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, ctypes.pointer(extra))))
-        user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
-        user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
+        ex = ctypes.c_ulong(0)
+        d = INPUT(type=INPUT_KEYBOARD, u=_U(ki=KEYBDINPUT(vk, 0, 0, 0, ctypes.pointer(ex))))
+        u = INPUT(type=INPUT_KEYBOARD, u=_U(ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, ctypes.pointer(ex))))
+        user32.SendInput(1, ctypes.byref(d), ctypes.sizeof(INPUT))
+        user32.SendInput(1, ctypes.byref(u), ctypes.sizeof(INPUT))
 
-    def jiggle_mouse(px=2):
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetCursorPos(pt.x + px, pt.y)
-        time.sleep(0.03)
-        user32.SetCursorPos(pt.x, pt.y)  # volta exatamente pra onde estava
-else:  # fora do Windows: roda em modo demo (painel abre, sem input real)
+    def _pos():
+        p = wintypes.POINT(); user32.GetCursorPos(ctypes.byref(p)); return p.x, p.y
+
+    def jiggle():
+        x, y = _pos()
+        user32.SetCursorPos(x + 3, y); time.sleep(0.03); user32.SetCursorPos(x, y)
+
+    def circle():
+        x, y = _pos()
+        for a in range(0, 360, 45):
+            user32.SetCursorPos(x + int(6 * math.cos(math.radians(a))),
+                                y + int(6 * math.sin(math.radians(a))))
+            time.sleep(0.012)
+        user32.SetCursorPos(x, y)
+
+    def prevent_sleep(on):
+        kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED if on else ES_CONTINUOUS)
+
+    def f8_down():
+        return bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
+else:  # fora do Windows: painel abre em modo demo, sem input real
     def tap_key(vk=0): pass
-    def jiggle_mouse(px=2): pass
+    def jiggle(): pass
+    def circle(): pass
+    def prevent_sleep(on): pass
+    def f8_down(): return False
 
 # ---------------- paleta ----------------
-BG      = "#0d0f14"
-PANEL   = "#151a23"
-CARD    = "#1b212c"
-TEXT    = "#e6e9ef"
-MUTED   = "#8b93a7"
-ACCENT  = "#7c4dff"
-CYAN    = "#00e5ff"
-OK      = "#28d17c"
-OFF     = "#ff4d6d"
+BG, PANEL, CARD = "#0d0f14", "#151a23", "#1b212c"
+TEXT, MUTED = "#e6e9ef", "#8b93a7"
+ACCENT, CYAN, OK, OFF = "#7c4dff", "#00e5ff", "#28d17c", "#ff4d6d"
+
+PACES = {"Suave": 60, "Normal": 30, "Frequente": 15}  # segundos-base por ritmo
+
 
 class PhantomPanel:
     def __init__(self, root):
         self.root = root
         self.running = False
-        self.mode = tk.StringVar(value="key")   # key | mouse | both
         self.count = 0
         self.next_fire = 0.0
-        self.start_t = 0.0
+        self._f8_prev = False
+
+        # metodos (varios ao mesmo tempo)
+        self.m_sleep  = tk.BooleanVar(value=True)   # impedir suspensao (API)
+        self.m_key    = tk.BooleanVar(value=True)   # tecla segura F15
+        self.m_jiggle = tk.BooleanVar(value=False)  # mouse tremer
+        self.m_circle = tk.BooleanVar(value=False)  # mouse circulo
+        self.pace = tk.StringVar(value="Normal")
+        self.topmost = tk.BooleanVar(value=False)
 
         root.title("Phantom Panel")
         root.configure(bg=BG)
-        root.geometry("440x600")
+        root.geometry("460x640")
         root.resizable(False, False)
 
-        self._build_header()
-        self._build_controls()
-        self._build_stats()
-        self._build_log()
-        self._build_footer()
+        self._header()
+        self._methods()
+        self._pace_row()
+        self._extras()
+        self._main_button()
+        self._status()
+        self._log_box()
+        self._footer()
 
-        self.log("Phantom Panel pronto." if IS_WIN else "Modo DEMO (nao-Windows): painel ativo, sem envio de input.")
+        self.log("Phantom Panel v2 pronto." if IS_WIN
+                 else "Modo DEMO (nao-Windows): painel ativo, sem envio de input.")
         self._tick()
 
-    # ---------- logo desenhada ----------
-    def _draw_ghost(self, c):
-        c.create_oval(6, 6, 78, 78, outline=ACCENT, width=2)          # anel externo
-        c.create_oval(12, 12, 72, 72, outline=CYAN, width=1)          # anel interno
+    # ---------- logo ----------
+    def _ghost(self, c):
+        c.create_oval(6, 6, 78, 78, outline=ACCENT, width=2)
+        c.create_oval(12, 12, 72, 72, outline=CYAN, width=1)
         w = "#eef1f7"
-        c.create_arc(26, 24, 58, 56, start=0, extent=180, fill=w, outline=w)   # cupula
-        c.create_rectangle(26, 40, 58, 62, fill=w, outline=w)                  # corpo
-        c.create_arc(26, 55, 37, 68, start=180, extent=180, fill=w, outline=w) # pe 1
-        c.create_arc(36, 55, 48, 68, start=180, extent=180, fill=w, outline=w) # pe 2
-        c.create_arc(47, 55, 58, 68, start=180, extent=180, fill=w, outline=w) # pe 3
-        c.create_oval(33, 37, 40, 46, fill=PANEL, outline=PANEL)              # olho E
-        c.create_oval(44, 37, 51, 46, fill=PANEL, outline=PANEL)              # olho D
+        c.create_arc(26, 24, 58, 56, start=0, extent=180, fill=w, outline=w)
+        c.create_rectangle(26, 40, 58, 62, fill=w, outline=w)
+        for x0, x1 in ((26, 37), (36, 48), (47, 58)):
+            c.create_arc(x0, 55, x1, 68, start=180, extent=180, fill=w, outline=w)
+        c.create_oval(33, 37, 40, 46, fill=PANEL, outline=PANEL)
+        c.create_oval(44, 37, 51, 46, fill=PANEL, outline=PANEL)
 
-    def _build_header(self):
-        head = tk.Frame(self.root, bg=PANEL)
-        head.pack(fill="x")
-        logo = tk.Canvas(head, width=84, height=84, bg=PANEL, highlightthickness=0)
-        logo.pack(side="left", padx=(16, 10), pady=14)
-        self._draw_ghost(logo)
-        box = tk.Frame(head, bg=PANEL)
-        box.pack(side="left", anchor="w", pady=20)
+    def _header(self):
+        h = tk.Frame(self.root, bg=PANEL); h.pack(fill="x")
+        logo = tk.Canvas(h, width=84, height=84, bg=PANEL, highlightthickness=0)
+        logo.pack(side="left", padx=(16, 10), pady=14); self._ghost(logo)
+        box = tk.Frame(h, bg=PANEL); box.pack(side="left", anchor="w", pady=22)
         tk.Label(box, text="PHANTOM PANEL", bg=PANEL, fg=TEXT,
                  font=("Segoe UI Semibold", 17)).pack(anchor="w")
-        tk.Label(box, text="anti-afk  ·  keep-awake utility", bg=PANEL, fg=CYAN,
+        tk.Label(box, text="anti-afk  ·  keep-awake  ·  v2", bg=PANEL, fg=CYAN,
                  font=("Segoe UI", 9)).pack(anchor="w")
         tk.Frame(self.root, bg=ACCENT, height=2).pack(fill="x")
 
     def _card(self, title):
-        card = tk.Frame(self.root, bg=CARD)
-        card.pack(fill="x", padx=16, pady=(14, 0))
-        tk.Label(card, text=title, bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        return card
+        c = tk.Frame(self.root, bg=CARD); c.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(c, text=title, bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        return c
 
-    def _build_controls(self):
-        card = self._card("MODO DE ATIVIDADE")
-        row = tk.Frame(card, bg=CARD); row.pack(fill="x", padx=12, pady=(0, 10))
-        for val, label in (("key", "Tecla F15"), ("mouse", "Mouse"), ("both", "Ambos")):
-            tk.Radiobutton(row, text=label, value=val, variable=self.mode,
+    def _chk(self, parent, var, text, cmd=None):
+        return tk.Checkbutton(parent, text=text, variable=var, command=cmd,
+                              bg=CARD, fg=TEXT, selectcolor=PANEL, activebackground=CARD,
+                              activeforeground=CYAN, font=("Segoe UI", 10),
+                              anchor="w", padx=4)
+
+    def _methods(self):
+        c = self._card("METODOS  (pode marcar varios)")
+        self._chk(c, self.m_sleep, "Impedir suspensao do PC  (API, sem input falso)",
+                  self._sleep_toggle).pack(fill="x", padx=10)
+        self._chk(c, self.m_key, "Tecla segura  (F15 — nao mexe em jogo)").pack(fill="x", padx=10)
+        self._chk(c, self.m_jiggle, "Mouse: tremer  (3px e volta)").pack(fill="x", padx=10)
+        self._chk(c, self.m_circle, "Mouse: circulo  (micro-giro e volta)").pack(fill="x", padx=10, pady=(0, 8))
+
+    def _pace_row(self):
+        c = self._card("RITMO")
+        row = tk.Frame(c, bg=CARD); row.pack(fill="x", padx=10, pady=(0, 10))
+        for name in PACES:
+            tk.Radiobutton(row, text=name, value=name, variable=self.pace,
                            bg=CARD, fg=TEXT, selectcolor=PANEL, activebackground=CARD,
-                           activeforeground=CYAN, font=("Segoe UI", 10),
-                           indicatoron=True).pack(side="left", padx=(0, 14))
+                           activeforeground=CYAN, font=("Segoe UI", 10)).pack(side="left", padx=(0, 16))
 
-        card2 = self._card("INTERVALO (segundos, aleatorio entre min e max)")
-        r2 = tk.Frame(card2, bg=CARD); r2.pack(fill="x", padx=12, pady=(0, 10))
-        self.min_s = tk.Scale(r2, from_=5, to=300, orient="horizontal", label="min",
-                              bg=CARD, fg=TEXT, troughcolor=PANEL, highlightthickness=0,
-                              font=("Segoe UI", 8), length=180)
-        self.min_s.set(30); self.min_s.pack(side="left", padx=(0, 10))
-        self.max_s = tk.Scale(r2, from_=5, to=300, orient="horizontal", label="max",
-                              bg=CARD, fg=TEXT, troughcolor=PANEL, highlightthickness=0,
-                              font=("Segoe UI", 8), length=180)
-        self.max_s.set(90); self.max_s.pack(side="left")
+    def _extras(self):
+        c = self._card("EXTRAS")
+        row = tk.Frame(c, bg=CARD); row.pack(fill="x", padx=10, pady=(0, 10))
+        self._chk(row, self.topmost, "Sempre no topo", self._topmost_toggle).pack(side="left")
+        tk.Label(row, text="atalho global:  F8  liga/desliga", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="right")
 
+    def _main_button(self):
         self.btn = tk.Button(self.root, text="▶   INICIAR", command=self.toggle,
                              bg=ACCENT, fg="white", activebackground="#6a3de0",
                              activeforeground="white", relief="flat",
                              font=("Segoe UI Semibold", 13), height=2, cursor="hand2")
-        self.btn.pack(fill="x", padx=16, pady=(16, 0))
+        self.btn.pack(fill="x", padx=16, pady=(14, 0))
 
-    def _build_stats(self):
-        card = self._card("STATUS")
-        grid = tk.Frame(card, bg=CARD); grid.pack(fill="x", padx=12, pady=(0, 12))
-        self.lbl_state = self._stat(grid, 0, "Estado", "IDLE", OFF)
-        self.lbl_count = self._stat(grid, 1, "Acoes", "0", TEXT)
-        self.lbl_next  = self._stat(grid, 2, "Proxima", "--", TEXT)
-        self.lbl_up    = self._stat(grid, 3, "Uptime", "00:00", TEXT)
+    def _status(self):
+        c = self._card("STATUS")
+        g = tk.Frame(c, bg=CARD); g.pack(fill="x", padx=12, pady=(0, 12))
+        self.lbl_state = self._stat(g, 0, "Estado", "IDLE", OFF)
+        self.lbl_count = self._stat(g, 1, "Acoes enviadas", "0", TEXT)
 
     def _stat(self, parent, col, name, val, color):
-        f = tk.Frame(parent, bg=CARD); f.grid(row=0, column=col, padx=(0, 18))
+        f = tk.Frame(parent, bg=CARD); f.grid(row=0, column=col, padx=(0, 28))
         tk.Label(f, text=name, bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
-        lbl = tk.Label(f, text=val, bg=CARD, fg=color, font=("Consolas", 13, "bold"))
+        lbl = tk.Label(f, text=val, bg=CARD, fg=color, font=("Consolas", 14, "bold"))
         lbl.pack(anchor="w")
         return lbl
 
-    def _build_log(self):
-        card = self._card("LOG")
-        self.txt = tk.Text(card, height=7, bg=PANEL, fg=MUTED, relief="flat",
-                           font=("Consolas", 9), wrap="word", state="disabled",
-                           insertbackground=TEXT)
+    def _log_box(self):
+        c = self._card("LOG")
+        self.txt = tk.Text(c, height=6, bg=PANEL, fg=MUTED, relief="flat",
+                           font=("Consolas", 9), wrap="word", state="disabled")
         self.txt.pack(fill="both", padx=12, pady=(0, 12))
 
-    def _build_footer(self):
+    def _footer(self):
         tk.Label(self.root,
-                 text="Mantem o sistema acordado. Nao e game bot nem bypass de anticheat.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(pady=10)
+                 text="Mantem o sistema acordado. Nao move personagem em jogo nem burla anticheat.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(pady=8)
 
-    # ---------- logica ----------
+    # ---------- comportamento ----------
     def log(self, msg):
         self.txt.configure(state="normal")
         self.txt.insert("end", time.strftime("[%H:%M:%S] ") + msg + "\n")
-        self.txt.see("end")
-        self.txt.configure(state="disabled")
+        self.txt.see("end"); self.txt.configure(state="disabled")
+
+    def _sleep_toggle(self):
+        if self.running:
+            prevent_sleep(self.m_sleep.get())
+
+    def _topmost_toggle(self):
+        self.root.attributes("-topmost", self.topmost.get())
+
+    def _interval(self):
+        base = PACES[self.pace.get()]
+        return base * random.uniform(0.8, 1.2)  # jitter leve: sinal de atividade estavel
 
     def toggle(self):
         self.running = not self.running
         if self.running:
-            self.start_t = time.time()
             self.count = 0
-            self._schedule_next(initial=True)
+            if self.m_sleep.get():
+                prevent_sleep(True)
+            self.next_fire = time.time() + 2
             self.btn.configure(text="■   PARAR", bg=OFF, activebackground="#e23a57")
             self.lbl_state.configure(text="ACTIVE", fg=OK)
-            self.log("Iniciado | modo=%s | intervalo=%d-%ds" %
-                     (self.mode.get(), self.min_s.get(), self.max_s.get()))
+            self.log("Iniciado | ritmo=%s" % self.pace.get())
         else:
+            prevent_sleep(False)
             self.btn.configure(text="▶   INICIAR", bg=ACCENT, activebackground="#6a3de0")
             self.lbl_state.configure(text="IDLE", fg=OFF)
-            self.lbl_next.configure(text="--")
             self.log("Parado.")
 
-    def _schedule_next(self, initial=False):
-        lo, hi = sorted((self.min_s.get(), self.max_s.get()))
-        delay = 2 if initial else random.uniform(lo, hi)
-        self.next_fire = time.time() + delay
-
     def _fire(self):
-        m = self.mode.get()
-        if m in ("key", "both"):
-            tap_key()
-        if m in ("mouse", "both"):
-            jiggle_mouse()
-        self.count += 1
-        self.lbl_count.configure(text=str(self.count))
-        self.log("sinal enviado (%s)" % m + ("" if IS_WIN else " [demo]"))
-        self._schedule_next()
+        did = []
+        if self.m_key.get():    tap_key();  did.append("F15")
+        if self.m_jiggle.get(): jiggle();   did.append("tremer")
+        if self.m_circle.get(): circle();   did.append("circulo")
+        if did:
+            self.count += 1
+            self.lbl_count.configure(text=str(self.count))
+            self.log("sinal: " + ", ".join(did) + ("" if IS_WIN else " [demo]"))
+        self.next_fire = time.time() + self._interval()
 
     def _tick(self):
-        if self.running:
-            now = time.time()
-            rem = self.next_fire - now
-            if rem <= 0:
-                self._fire()
-            else:
-                self.lbl_next.configure(text="%2ds" % int(rem))
-            up = int(now - self.start_t)
-            self.lbl_up.configure(text="%02d:%02d" % (up // 60, up % 60))
-        self.root.after(250, self._tick)
+        # hotkey global F8 (deteccao de borda)
+        down = f8_down()
+        if down and not self._f8_prev:
+            self.toggle()
+        self._f8_prev = down
+
+        if self.running and time.time() >= self.next_fire:
+            self._fire()
+        self.root.after(200, self._tick)
 
 
 if __name__ == "__main__":
